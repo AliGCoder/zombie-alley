@@ -1343,44 +1343,82 @@ function setModel(char, clips, name) {
 // The patromes model is in centimetres, z up, facing -y (mouth at z~166).
 const INFECT_GLSL = `
 varying vec3 vBind;
+uniform vec4 uOutfit;            // x: wears a shirt, y: where the sleeves end (cm from the spine), z: how ripped, w: seed
+uniform vec3 uShirt, uPants;
 float zh(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
 float zn(vec3 p) { vec3 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
   return mix(mix(mix(zh(i), zh(i + vec3(1,0,0)), f.x), mix(zh(i + vec3(0,1,0)), zh(i + vec3(1,1,0)), f.x), f.y),
              mix(mix(zh(i + vec3(0,0,1)), zh(i + vec3(1,0,1)), f.x), mix(zh(i + vec3(0,1,1)), zh(i + vec3(1,1,1)), f.x), f.y), f.z); }
 float zf(vec3 p) { return zn(p) * 0.55 + zn(p * 2.1) * 0.3 + zn(p * 4.3) * 0.15; }
+// clothes, from the rest pose (cm, z up, facing -y)
+float zShirt(vec3 P) {
+  if (uOutfit.x < 0.5) return 0.0;
+  float top = abs(P.x) < 11.0 ? 149.0 - smoothstep(2.0, -8.0, P.y) * 5.0 : 170.0;      // collar dips at the front
+  float sleeve = uOutfit.y + (zn(P * 0.35) - 0.5) * 5.0;                                 // ragged sleeve ends
+  return step(abs(P.x), sleeve) * step(96.0 + zn(P * 0.3) * 3.0, P.z) * step(P.z, top);
+}
+float zPants(vec3 P) { return step(7.5, P.z) * step(P.z, 101.0) * step(abs(P.x), 24.0); }
+float zShoe(vec3 P) { return step(P.z, 7.5) * step(abs(P.x), 24.0); }
+float zHole(vec3 P) { return smoothstep(0.80 - uOutfit.z * 0.12, 0.83 - uOutfit.z * 0.12, zf(P * 0.11 + uOutfit.w)); }
 `;
 const INFECT_PAINT = `#include <map_fragment>
   vec3 P = vBind; float front = smoothstep(2.0, -6.0, P.y);
   // blood: a dark wet smear from the mouth down chin, neck and chest, running in drips
   float drip = zn(vec3(P.x * 0.22, P.z * 0.012, 3.0)), mouthD = length((P - vec3(0.0, -7.0, 165.5)) * vec3(1.0, 1.0, 1.4));
-  float run = front * smoothstep(168.0, 160.0, P.z) * smoothstep(105.0 + drip * 30.0, 150.0, P.z) * smoothstep(22.0, 6.0, abs(P.x) + (1.0 - drip) * 14.0);
+  float run = front * smoothstep(168.0, 160.0, P.z) * smoothstep(100.0 + drip * 30.0, 150.0, P.z) * smoothstep(22.0, 6.0, abs(P.x) + (1.0 - drip) * 14.0);
   float blood = max(smoothstep(13.0, 4.0, mouthD + zn(P * 0.6) * 4.0), run * smoothstep(0.25, 0.45, drip + zf(P * 0.15) * 0.4));
   blood = max(blood, smoothstep(55.0, 80.0, abs(P.x)) * smoothstep(0.45, 0.65, zf(P * 0.12)));   // hands and forearms
   blood = max(blood, smoothstep(0.72, 0.8, zf(P * 0.09 + 7.0)) * 0.9);                          // spatters all over
   float grime = zf(P * 0.05);
-#ifdef INFECT_CLOTH
-  diffuseColor.rgb = mix(diffuseColor.rgb * vec3(0.55, 0.5, 0.45), vec3(0.08, 0.07, 0.06), grime * 0.6);
-#else
   float l = dot(diffuseColor.rgb, vec3(0.3, 0.59, 0.11));
-  vec3 c = mix(diffuseColor.rgb, l * vec3(0.84, 0.9, 0.8), 0.88) * 0.9;                    // sickly grey-green pallor
+  vec3 c = mix(diffuseColor.rgb, l * vec3(0.84, 0.9, 0.8), 0.88) * 0.9;                     // sickly grey-green pallor
   c = mix(c, c * vec3(0.62, 0.48, 0.55), smoothstep(0.45, 0.75, zf(P * 0.07)));                // purple-brown bruising
   float vein = smoothstep(0.06, 0.0, abs(zf(P * 0.32) - 0.5)) * smoothstep(0.3, 0.6, zn(P * 0.05));
-  c = mix(c, vec3(0.16, 0.12, 0.2), vein * 0.8);                                              // dark veins
+  c = mix(c, vec3(0.16, 0.12, 0.2), vein * 0.8);                                               // dark veins
   float sock = front * smoothstep(9.0, 3.0, length((vec3(abs(P.x), P.y, P.z) - vec3(3.3, -6.0, 172.5)) * vec3(0.8, 1.0, 1.3)));
   c = mix(c, vec3(0.22, 0.03, 0.03), sock * 0.85);                                             // raw red eye sockets
   c *= 1.0 - smoothstep(110.0, 0.0, P.z) * grime * 0.45;                                       // filth on the legs
+  // torn, filthy street clothes
+  float sh = zShirt(P), pa = zPants(P), so = zShoe(P), rip = zf(P * 0.11 + uOutfit.w);
+  float hole = zHole(P), cloth = max(sh, pa) * (1.0 - hole);
+  vec3 cc = sh > 0.5 ? uShirt : uPants;
+  float weave = pa > 0.5 && sh < 0.5 ? zn(vec3((P.x + P.z) * 3.0, (P.y - P.z) * 3.0, P.z * 0.5)) : zn(P * 2.6);
+  cc *= 0.82 + weave * 0.3;                                                                    // weave (jeans: diagonal twill)
+  cc *= 1.0 - smoothstep(0.55, 0.9, zf(P * 0.04 + 3.0)) * 0.35;                                // sweat and rain soak
+  cc = mix(cc, vec3(0.05, 0.04, 0.03), smoothstep(0.35, 0.85, grime) * 0.75);                  // mud and filth
+  cc = mix(cc, vec3(0.07, 0.055, 0.04), smoothstep(40.0, 8.0, P.z) * pa * 0.6);                // muddy trouser legs
+  cc *= 1.0 - smoothstep(0.74 - uOutfit.z * 0.12, 0.8 - uOutfit.z * 0.12, rip) * 0.55;         // frayed, darker around rips
+  float hem = sh * max(smoothstep(uOutfit.y - 2.5, uOutfit.y, abs(P.x)) * step(18.0, abs(P.x)), smoothstep(101.0, 97.0, P.z))
+            + pa * smoothstep(97.0, 101.0, P.z);                                                // hems, cuffs and waistband
+  cc *= 1.0 - clamp(hem, 0.0, 1.0) * 0.45;
+  c = mix(c, cc, cloth);
+  c = mix(c, vec3(0.045, 0.04, 0.035) * (0.8 + zn(P * 2.0) * 0.4), so);                        // scuffed shoes
   diffuseColor.rgb = c;
-#endif
-  diffuseColor.rgb = mix(diffuseColor.rgb, mix(vec3(0.3, 0.015, 0.01), vec3(0.12, 0.01, 0.01), zn(P * 0.4)), blood);
-  float zBlood = blood;`;
-function infectSkin(m, cloth) {
+  diffuseColor.rgb = mix(diffuseColor.rgb, mix(vec3(0.3, 0.015, 0.01), vec3(0.12, 0.01, 0.01), zn(P * 0.4)), blood * (1.0 - cloth * 0.25));
+  float zBlood = blood, zCloth = max(cloth, so);`;
+// outfits: street clothes in dull, grimy colours (28 Days Later: ordinary people, caught in what they were wearing)
+const Z_SHIRTS = [0x4b4d50, 0x232a3d, 0x4a1d1e, 0x2e4a6e, 0x434630, 0x1b1b1d, 0x5d7488, 0x5a3a2a, 0x6e2a1a, 0x2f4a3a];   // nothing skin-coloured
+const Z_PANTS = [0x2c3a55, 0x26324a, 0x19191b, 0x56503e, 0x4c4d52, 0x3a3328];
+function zombieOutfit(type) {
+  const pick = a => new THREE.Color(a[Math.floor(Math.random() * a.length)]);
+  return {
+    o: new THREE.Vector4(type === 'brute' ? (Math.random() < 0.5 ? 1 : 0) : (Math.random() < 0.9 ? 1 : 0),   // some brutes are bare-chested
+      Math.random() < 0.45 ? 66 : 36 + Math.random() * 6,                                                      // long or short sleeves
+      type === 'runner' ? 0.9 : Math.random() * 0.8, Math.random() * 50),                                     // how torn; seed
+    shirt: pick(Z_SHIRTS), pants: pick(Z_PANTS) };
+}
+function infectSkin(m, outfit) {
   m.onBeforeCompile = sh => {
-    sh.vertexShader = 'varying vec3 vBind;\n' + sh.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\n  vBind = position;');
-    sh.fragmentShader = (cloth ? '#define INFECT_CLOTH\n' : '') + INFECT_GLSL + sh.fragmentShader
+    sh.uniforms.uOutfit = { value: outfit.o }; sh.uniforms.uShirt = { value: outfit.shirt }; sh.uniforms.uPants = { value: outfit.pants };
+    sh.vertexShader = INFECT_GLSL + sh.vertexShader.replace('#include <begin_vertex>', `#include <begin_vertex>
+  vBind = position;
+  transformed += normal * (zShirt(position) * 0.7 + zPants(position) * 1.1 + zShoe(position) * 1.3) * (1.0 - zHole(position));   // cloth thickness`);
+    sh.fragmentShader = INFECT_GLSL + sh.fragmentShader
       .replace('#include <map_fragment>', INFECT_PAINT)
-      .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n  roughnessFactor = mix(roughnessFactor, 0.22, zBlood);');
+      .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n  roughnessFactor = mix(mix(roughnessFactor, 0.9, zCloth), 0.22, zBlood);')
+      .replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\n  normal = normalize(mix(normal, nonPerturbedNormal, zCloth * 0.8));');   // no skin pores on cloth
   };
-  m.customProgramCacheKey = () => cloth ? 'infect-cloth' : 'infect-skin';
+  m.customProgramCacheKey = () => 'infect-zombie';
   m.needsUpdate = true;
 }
 
@@ -1395,12 +1433,12 @@ function makeModelZombie(type) {
   // every type uses the model; tint and build tell them apart (root scale comes from TYPES)
   const look = { walker: [0xffffff, 1], runner: [0xece6dc, 0.95], brute: [0xb4c0a4, 1.3], spitter: [0xd8e09a, 1.15], boss: [0x9a8490, 1.2] }[type] || [0xffffff, 1];
   if (look[0] !== 0xffffff) mats.forEach(m => m.color && m.color.multiply(new THREE.Color(look[0])));
-  // infected look: bloodshot glowing red eyes, blood-soaked mouth
+  // infected look: bloodshot glowing red eyes, blood-soaked mouth, torn clothes
+  const outfit = zombieOutfit(type);
   mats.forEach(m => {
     if (/eye_[lr]|cornea/i.test(m.name) && !/occlusion/i.test(m.name)) { m.color.multiply(new THREE.Color(0xff5050)); m.userData.em = 0x9a0000; m.emissive.setHex(0x9a0000); }
     else if (/mouth|teeth|tongue/i.test(m.name)) m.color.multiply(new THREE.Color(0x9a2a2a));
-    if (MODEL.name === 'zombie' && /skin|nails/i.test(m.name)) infectSkin(m, false);
-    else if (MODEL.name === 'zombie' && /boxers|cloth|shirt|pants/i.test(m.name)) infectSkin(m, true);
+    if (MODEL.name === 'zombie' && /skin|nails|boxers/i.test(m.name)) infectSkin(m, outfit);   // boxers end up under the trousers
   });
   const holder = new THREE.Group(); holder.scale.set(MODEL.s * look[1], MODEL.s, MODEL.s * look[1]); holder.position.copy(MODEL.off); holder.add(inst);
   const body = new THREE.Group(); body.add(holder);
