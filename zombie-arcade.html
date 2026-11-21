@@ -1194,6 +1194,19 @@ function poseWalk(b, ph, fast) {
 // Drop a rigged zombie model (.glb / .gltf / .fbx, or a Sketchfab .zip) onto the game, plus any
 // Mixamo animation .fbx files. Walkers and runners then use it. Animations are picked by name:
 // walk / run / attack / die / idle. The files are kept in IndexedDB so the model comes back next time.
+// loose clothes modelled in Blender (tools/make_clothes.py), skinned to the same skeleton as the zombie
+let CLOTHES = null;
+function loadClothes() {
+  new GLTFLoader().load('models/zombie_clothes.glb', g => {
+    // Blender bakes a skinned mesh into scene space (metres, y up): bring it back into the body mesh's own space
+    let bodyM = null; MODEL.tpl.updateMatrixWorld(true);
+    MODEL.tpl.traverse(o => { if (!bodyM && o.isSkinnedMesh) bodyM = o; });
+    const toBody = new THREE.Matrix4().copy(MODEL.tpl.matrixWorld).invert().multiply(bodyM.matrixWorld).invert();
+    const out = {};
+    g.scene.traverse(o => { if (o.isSkinnedMesh) { o.geometry = o.geometry.clone().applyMatrix4(toBody); out[o.name.replace(/_\d+$/, '')] = o; } });
+    CLOTHES = out;
+  }, undefined, () => {});
+}
 const MODEL = { tpl: null, s: 1, off: new THREE.Vector3(), clips: {}, bones: {}, name: '' };
 const draco = new DRACOLoader().setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/libs/draco/gltf/');
 const headChunkMat = new THREE.MeshStandardMaterial({ color: 0x5a0808, roughness: 0.3 });
@@ -1345,6 +1358,7 @@ const INFECT_GLSL = `
 varying vec3 vBind;
 uniform vec4 uOutfit;            // x: wears a shirt, y: where the sleeves end (cm from the spine), z: how ripped, w: seed
 uniform vec3 uShirt, uPants;
+uniform vec2 uWear;             // x: paint clothes onto the body, y: this mesh is a garment (1 shirt, 2 trousers)
 float zh(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
 float zn(vec3 p) { vec3 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
   return mix(mix(mix(zh(i), zh(i + vec3(1,0,0)), f.x), mix(zh(i + vec3(0,1,0)), zh(i + vec3(1,1,0)), f.x), f.y),
@@ -1352,12 +1366,12 @@ float zn(vec3 p) { vec3 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
 float zf(vec3 p) { return zn(p) * 0.55 + zn(p * 2.1) * 0.3 + zn(p * 4.3) * 0.15; }
 // clothes, from the rest pose (cm, z up, facing -y)
 float zShirt(vec3 P) {
-  if (uOutfit.x < 0.5) return 0.0;
+  if (uOutfit.x < 0.5 || uWear.x < 0.5) return 0.0;
   float top = abs(P.x) < 11.0 ? 149.0 - smoothstep(2.0, -8.0, P.y) * 5.0 : 170.0;      // collar dips at the front
   float sleeve = uOutfit.y + (zn(P * 0.35) - 0.5) * 5.0;                                 // ragged sleeve ends
   return step(abs(P.x), sleeve) * step(96.0 + zn(P * 0.3) * 3.0, P.z) * step(P.z, top);
 }
-float zPants(vec3 P) { return step(7.5, P.z) * step(P.z, 101.0) * step(abs(P.x), 24.0); }
+float zPants(vec3 P) { return step(0.5, uWear.x) * step(7.5, P.z) * step(P.z, 101.0) * step(abs(P.x), 24.0); }
 float zShoe(vec3 P) { return step(P.z, 7.5) * step(abs(P.x), 24.0); }
 float zHole(vec3 P) { return smoothstep(0.80 - uOutfit.z * 0.12, 0.83 - uOutfit.z * 0.12, zf(P * 0.11 + uOutfit.w)); }
 `;
@@ -1380,7 +1394,8 @@ const INFECT_PAINT = `#include <map_fragment>
   c *= 1.0 - smoothstep(110.0, 0.0, P.z) * grime * 0.45;                                       // filth on the legs
   // torn, filthy street clothes
   float sh = zShirt(P), pa = zPants(P), so = zShoe(P), rip = zf(P * 0.11 + uOutfit.w);
-  float hole = zHole(P), cloth = max(sh, pa) * (1.0 - hole);
+  if (uWear.y > 0.5) { sh = uWear.y < 1.5 ? 1.0 : 0.0; pa = 1.0 - sh; so = 0.0; if (zHole(P) > 0.5) discard; }   // real garment: rips are holes
+  float hole = uWear.y > 0.5 ? 0.0 : zHole(P), cloth = max(sh, pa) * (1.0 - hole);
   vec3 cc = sh > 0.5 ? uShirt : uPants;
   float weave = pa > 0.5 && sh < 0.5 ? zn(vec3((P.x + P.z) * 3.0, (P.y - P.z) * 3.0, P.z * 0.5)) : zn(P * 2.6);
   cc *= 0.82 + weave * 0.3;                                                                    // weave (jeans: diagonal twill)
@@ -1407,9 +1422,9 @@ function zombieOutfit(type) {
       type === 'runner' ? 0.9 : Math.random() * 0.8, Math.random() * 50),                                     // how torn; seed
     shirt: pick(Z_SHIRTS), pants: pick(Z_PANTS) };
 }
-function infectSkin(m, outfit) {
+function infectSkin(m, outfit, wear = new THREE.Vector2(1, 0)) {
   m.onBeforeCompile = sh => {
-    sh.uniforms.uOutfit = { value: outfit.o }; sh.uniforms.uShirt = { value: outfit.shirt }; sh.uniforms.uPants = { value: outfit.pants };
+    sh.uniforms.uOutfit = { value: outfit.o }; sh.uniforms.uShirt = { value: outfit.shirt }; sh.uniforms.uPants = { value: outfit.pants }; sh.uniforms.uWear = { value: wear };
     sh.vertexShader = INFECT_GLSL + sh.vertexShader.replace('#include <begin_vertex>', `#include <begin_vertex>
   vBind = position;
   transformed += normal * (zShirt(position) * 0.7 + zPants(position) * 1.1 + zShoe(position) * 1.3) * (1.0 - zHole(position));   // cloth thickness`);
@@ -1434,12 +1449,29 @@ function makeModelZombie(type) {
   const look = { walker: [0xffffff, 1], runner: [0xece6dc, 0.95], brute: [0xb4c0a4, 1.3], spitter: [0xd8e09a, 1.15], boss: [0x9a8490, 1.2] }[type] || [0xffffff, 1];
   if (look[0] !== 0xffffff) mats.forEach(m => m.color && m.color.multiply(new THREE.Color(look[0])));
   // infected look: bloodshot glowing red eyes, blood-soaked mouth, torn clothes
-  const outfit = zombieOutfit(type);
+  const outfit = zombieOutfit(type), dressed = !!(CLOTHES && MODEL.name === 'zombie');
   mats.forEach(m => {
     if (/eye_[lr]|cornea/i.test(m.name) && !/occlusion/i.test(m.name)) { m.color.multiply(new THREE.Color(0xff5050)); m.userData.em = 0x9a0000; m.emissive.setHex(0x9a0000); }
     else if (/mouth|teeth|tongue/i.test(m.name)) m.color.multiply(new THREE.Color(0x9a2a2a));
-    if (MODEL.name === 'zombie' && /skin|nails|boxers/i.test(m.name)) infectSkin(m, outfit);   // boxers end up under the trousers
+    if (MODEL.name === 'zombie' && /skin|nails|boxers/i.test(m.name)) infectSkin(m, outfit, new THREE.Vector2(dressed ? 0 : 1, 0));
   });
+  if (dressed) {   // put on the Blender-modelled shirt and trousers, bound to this zombie's own bones
+    const body = []; inst.traverse(o => { if (o.isSkinnedMesh) body.push(o); });
+    const wear = (outfit.o.x > 0.5 ? [outfit.o.y > 50 ? 'Shirt_Long' : 'Shirt_Short'] : []).concat('Trousers');
+    for (const n of wear) {
+      const src = CLOTHES[n]; if (!src || !body.length) continue;
+      // the garments were cut from the body surface, so they share its space: bind with the body's own bone inverses
+      const sk = body[0].skeleton, bones = src.skeleton.bones.map(b => sk.bones.find(x => x.name === b.name));
+      if (bones.some(b => !b)) continue;
+      const inv = bones.map(b => sk.boneInverses[sk.bones.indexOf(b)]);
+      const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9, side: THREE.DoubleSide });
+      infectSkin(mat, outfit, new THREE.Vector2(0, n === 'Trousers' ? 2 : 1)); mats.push(mat);
+      const g = new THREE.SkinnedMesh(src.geometry, mat);
+      g.bind(new THREE.Skeleton(bones, inv), body[0].bindMatrix);
+      g.frustumCulled = false; g.castShadow = true; g.name = n;
+      body[0].parent.add(g);
+    }
+  }
   const holder = new THREE.Group(); holder.scale.set(MODEL.s * look[1], MODEL.s, MODEL.s * look[1]); holder.position.copy(MODEL.off); holder.add(inst);
   const body = new THREE.Group(); body.add(holder);
   const root = new THREE.Group(); root.add(body);
@@ -1571,6 +1603,7 @@ fetch('models/zombie.glb', { cache: 'no-cache' }).then(r => r.ok ? r.arrayBuffer
   .then(ok => {
     if (!ok) return Promise.reject();
     modelInfo.innerHTML += '<br><span style="color:#888">ZOMBIE MODEL "ZOMBIE" BY PATROMES (SKETCHFAB) · CC BY 4.0</span>';
+    loadClothes();
     idb('readwrite', st => st.delete('files')).catch(() => {});   // forget any stale test model
   })
   .catch(() => idb('readonly', st => st.get('files')).then(f => f ? loadModelFiles(f, false) : Promise.reject())
