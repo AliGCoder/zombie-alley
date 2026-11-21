@@ -87,8 +87,12 @@ document.body.prepend(renderer.domElement);
 renderer.domElement.addEventListener('webglcontextlost', e => {
   e.preventDefault();
   try { localStorage.setItem('zalley-quality', 'low'); } catch (er) {}
-  setTimeout(() => location.reload(), 300);
+  // reload once only: reloading over and over makes the browser block WebGL for the whole site
+  let again = false; try { again = sessionStorage.getItem('zalley-lost') === '1'; sessionStorage.setItem('zalley-lost', '1'); } catch (er) {}
+  if (!again) setTimeout(() => location.reload(), 300);
+  else document.body.insertAdjacentHTML('beforeend', '<div style="position:fixed;inset:0;display:grid;place-items:center;color:#ff5050;font:16px monospace;background:#000">GRAPHICS CARD RAN OUT OF MEMORY - CLOSE OTHER TABS, THEN RELOAD</div>');
 });
+setTimeout(() => { try { sessionStorage.removeItem('zalley-lost'); } catch (er) {} }, 30000);   // ran fine for 30s: allow a reload next time
 
 const SKY = 0x121824;
 const scene = new THREE.Scene();
@@ -1359,6 +1363,7 @@ varying vec3 vBind;
 uniform vec4 uOutfit;            // x: wears a shirt, y: where the sleeves end (cm from the spine), z: how ripped, w: seed
 uniform vec3 uShirt, uPants;
 uniform vec2 uWear;             // x: paint clothes onto the body, y: this mesh is a garment (1 shirt, 2 trousers)
+uniform vec4 uFlap;             // xyz: where the cloth spring has swung the loose fabric (cm), w: time
 float zh(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
 float zn(vec3 p) { vec3 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
   return mix(mix(mix(zh(i), zh(i + vec3(1,0,0)), f.x), mix(zh(i + vec3(0,1,0)), zh(i + vec3(1,1,0)), f.x), f.y),
@@ -1422,11 +1427,21 @@ function zombieOutfit(type) {
       type === 'runner' ? 0.9 : Math.random() * 0.8, Math.random() * 50),                                     // how torn; seed
     shirt: pick(Z_SHIRTS), pants: pick(Z_PANTS) };
 }
-function infectSkin(m, outfit, wear = new THREE.Vector2(1, 0)) {
+function infectSkin(m, outfit, wear = new THREE.Vector2(1, 0), flap = new THREE.Vector4()) {
   m.onBeforeCompile = sh => {
-    sh.uniforms.uOutfit = { value: outfit.o }; sh.uniforms.uShirt = { value: outfit.shirt }; sh.uniforms.uPants = { value: outfit.pants }; sh.uniforms.uWear = { value: wear };
+    sh.uniforms.uOutfit = { value: outfit.o }; sh.uniforms.uShirt = { value: outfit.shirt }; sh.uniforms.uPants = { value: outfit.pants }; sh.uniforms.uWear = { value: wear }; sh.uniforms.uFlap = { value: flap };
     sh.vertexShader = INFECT_GLSL + sh.vertexShader.replace('#include <begin_vertex>', `#include <begin_vertex>
   vBind = position;
+  if (uWear.y > 0.5) {   // cloth physics: hems, sleeve ends and trouser legs swing, trail and flutter
+    float hh = position.z, ax = abs(position.x);
+    float loose = uWear.y < 1.5
+      ? smoothstep(130.0, 90.0, hh) * (1.0 - smoothstep(16.0, 24.0, ax)) + smoothstep(uOutfit.y - 16.0, uOutfit.y + 3.0, ax) * 0.7
+      : smoothstep(72.0, 4.0, hh) * 0.35;   // trouser legs: less swing than a shirt hem
+    float sp = length(uFlap.xyz);
+    vec3 flut = vec3(sin(uFlap.w * 9.0 + hh * 0.31 + position.y * 0.4), sin(uFlap.w * 7.3 + hh * 0.23 + position.x * 0.35),
+                     sin(uFlap.w * 11.0 + position.x * 0.5) * 0.4) * (0.35 + sp * 0.09);
+    transformed += (uFlap.xyz + flut) * loose;
+  }
   transformed += normal * (zShirt(position) * 0.7 + zPants(position) * 1.1 + zShoe(position) * 1.3) * (1.0 - zHole(position));   // cloth thickness`);
     sh.fragmentShader = INFECT_GLSL + sh.fragmentShader
       .replace('#include <map_fragment>', INFECT_PAINT)
@@ -1437,7 +1452,23 @@ function infectSkin(m, outfit, wear = new THREE.Vector2(1, 0)) {
   m.needsUpdate = true;
 }
 
-const _hv = new THREE.Vector3();
+const _hv = new THREE.Vector3(), _cv = new THREE.Vector3(), _cv2 = new THREE.Vector3(), _cq = new THREE.Quaternion();
+// Cloth physics: a damped spring per zombie. The loose fabric lags behind the hips (sprinting throws the hem back,
+// each stride bounces it, stopping swings it forward) and the shader adds wind flutter on top.
+function updateCloth(m, dt) {
+  const c = m.cloth; if (!c.bone || dt <= 0) return;
+  c.bone.getWorldPosition(_cv);
+  if (!c.init) { c.prev.copy(_cv); c.init = true; }
+  const vel = _cv2.copy(_cv).sub(c.prev).divideScalar(Math.max(dt, 1 / 120)); c.prev.copy(_cv);
+  m.root.getWorldQuaternion(_cq); vel.applyQuaternion(_cq.invert());          // into the zombie's frame: +z forward, +y up
+  if (vel.lengthSq() > 400) vel.setScalar(0);                                  // teleports (spawning, knock-back)
+  // target swing in the body's cm space (x side, +y back, z up): trail opposite the motion, lift a little at speed
+  const k = 3.2, sp = Math.hypot(vel.x, vel.z);
+  _cv.set(-vel.x * k, vel.z * k, -vel.y * k * 1.4 + sp * 0.9).clampLength(0, 14);
+  c.v.addScaledVector(_cv.sub(c.off), 70 * dt).multiplyScalar(Math.exp(-7 * dt));   // stiffness, damping
+  c.off.addScaledVector(c.v, dt);
+  c.flap.set(c.off.x, c.off.y, c.off.z, time);
+}
 function makeModelZombie(type) {
   const inst = SkeletonUtils.clone(MODEL.tpl), mats = [];
   inst.traverse(o => {   // own materials per zombie so the red hit-flash is per zombie
@@ -1455,6 +1486,8 @@ function makeModelZombie(type) {
     else if (/mouth|teeth|tongue/i.test(m.name)) m.color.multiply(new THREE.Color(0x9a2a2a));
     if (MODEL.name === 'zombie' && /skin|nails|boxers/i.test(m.name)) infectSkin(m, outfit, new THREE.Vector2(dressed ? 0 : 1, 0));
   });
+  const cloth = dressed ? { flap: new THREE.Vector4(), off: new THREE.Vector3(), v: new THREE.Vector3(), prev: new THREE.Vector3(), init: false,
+                            bone: inst.getObjectByName(MODEL.bones.waist || MODEL.bones.chest || '') } : null;
   if (dressed) {   // put on the Blender-modelled shirt and trousers, bound to this zombie's own bones
     const body = []; inst.traverse(o => { if (o.isSkinnedMesh) body.push(o); });
     const wear = (outfit.o.x > 0.5 ? [outfit.o.y > 50 ? 'Shirt_Long' : 'Shirt_Short'] : []).concat('Trousers');
@@ -1465,7 +1498,7 @@ function makeModelZombie(type) {
       if (bones.some(b => !b)) continue;
       const inv = bones.map(b => sk.boneInverses[sk.bones.indexOf(b)]);
       const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9, side: THREE.DoubleSide });
-      infectSkin(mat, outfit, new THREE.Vector2(0, n === 'Trousers' ? 2 : 1)); mats.push(mat);
+      infectSkin(mat, outfit, new THREE.Vector2(0, n === 'Trousers' ? 2 : 1), cloth.flap); mats.push(mat);
       const g = new THREE.SkinnedMesh(src.geometry, mat);
       g.bind(new THREE.Skeleton(bones, inv), body[0].bindMatrix);
       g.frustumCulled = false; g.castShadow = true; g.name = n;
@@ -1491,7 +1524,7 @@ function makeModelZombie(type) {
   const proc = !!(pb.thighL && pb.thighR) && (!hasWalk || !clips.attack);
   const rest = proc ? Object.values(pb).filter(Boolean).map(b => [b, b.quaternion.clone()]) : [];
   return { root, body, spine: g(), head: g(), jaw: g(), legs: [g(), g()], knees: [g(), g()], arms: [g(), g()], elbows: [g(), g()],
-           hitboxes, mats, tilt: 0,
+           hitboxes, mats, tilt: 0, cloth,
            model: { inst, mixer: new THREE.AnimationMixer(inst), clips, cur: null, kind: '', headless: false, pb, proc, rest, hasWalk,
                     headBone: bone('head'), chestBone: bone('chest') } };
 }
@@ -1569,6 +1602,7 @@ function animModel(z, want, dt) {
   if (md.proc && want !== 'die') for (const [b, q] of md.rest) b.quaternion.copy(q);   // undo last frame's procedural turn
   if (clip || want !== 'die') md.mixer.update(dt);
   if (md.proc && want !== 'die') procPose(z, want);
+  if (z.m.cloth) updateCloth(z.m, dt);
   // keep the head/chest hitboxes on the animated bones
   const r = z.m.root; r.updateMatrixWorld(true);
   if (md.headBone && !md.headless) { md.headBone.getWorldPosition(_hv); r.worldToLocal(_hv); _hv.y += MODEL.headUp; z.m.hitboxes[0].position.copy(_hv); }
