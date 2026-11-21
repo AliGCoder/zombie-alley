@@ -1209,6 +1209,7 @@ function loadClothes() {
     const out = {};
     g.scene.traverse(o => { if (o.isSkinnedMesh) { o.geometry = o.geometry.clone().applyMatrix4(toBody); out[o.name.replace(/_\d+$/, '')] = o; } });
     CLOTHES = out;
+    if (typeof zombies !== 'undefined') for (const z of zombies) if (z.m && z.m.skinWear && !z.m.cloth) dressModel(z.m);
   }, undefined, () => {});
 }
 const MODEL = { tpl: null, s: 1, off: new THREE.Vector3(), clips: {}, bones: {}, name: '' };
@@ -1480,31 +1481,12 @@ function makeModelZombie(type) {
   const look = { walker: [0xffffff, 1], runner: [0xece6dc, 0.95], brute: [0xb4c0a4, 1.3], spitter: [0xd8e09a, 1.15], boss: [0x9a8490, 1.2] }[type] || [0xffffff, 1];
   if (look[0] !== 0xffffff) mats.forEach(m => m.color && m.color.multiply(new THREE.Color(look[0])));
   // infected look: bloodshot glowing red eyes, blood-soaked mouth, torn clothes
-  const outfit = zombieOutfit(type), dressed = !!(CLOTHES && MODEL.name === 'zombie');
+  const outfit = zombieOutfit(type), skinWear = [];
   mats.forEach(m => {
     if (/eye_[lr]|cornea/i.test(m.name) && !/occlusion/i.test(m.name)) { m.color.multiply(new THREE.Color(0xff5050)); m.userData.em = 0x9a0000; m.emissive.setHex(0x9a0000); }
     else if (/mouth|teeth|tongue/i.test(m.name)) m.color.multiply(new THREE.Color(0x9a2a2a));
-    if (MODEL.name === 'zombie' && /skin|nails|boxers/i.test(m.name)) infectSkin(m, outfit, new THREE.Vector2(dressed ? 0 : 1, 0));
+    if (MODEL.name === 'zombie' && /skin|nails|boxers/i.test(m.name)) { const w = new THREE.Vector2(1, 0); skinWear.push(w); infectSkin(m, outfit, w); }
   });
-  const cloth = dressed ? { flap: new THREE.Vector4(), off: new THREE.Vector3(), v: new THREE.Vector3(), prev: new THREE.Vector3(), init: false,
-                            bone: inst.getObjectByName(MODEL.bones.waist || MODEL.bones.chest || '') } : null;
-  if (dressed) {   // put on the Blender-modelled shirt and trousers, bound to this zombie's own bones
-    const body = []; inst.traverse(o => { if (o.isSkinnedMesh) body.push(o); });
-    const wear = (outfit.o.x > 0.5 ? [outfit.o.y > 50 ? 'Shirt_Long' : 'Shirt_Short'] : []).concat('Trousers');
-    for (const n of wear) {
-      const src = CLOTHES[n]; if (!src || !body.length) continue;
-      // the garments were cut from the body surface, so they share its space: bind with the body's own bone inverses
-      const sk = body[0].skeleton, bones = src.skeleton.bones.map(b => sk.bones.find(x => x.name === b.name));
-      if (bones.some(b => !b)) continue;
-      const inv = bones.map(b => sk.boneInverses[sk.bones.indexOf(b)]);
-      const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9, side: THREE.DoubleSide });
-      infectSkin(mat, outfit, new THREE.Vector2(0, n === 'Trousers' ? 2 : 1), cloth.flap); mats.push(mat);
-      const g = new THREE.SkinnedMesh(src.geometry, mat);
-      g.bind(new THREE.Skeleton(bones, inv), body[0].bindMatrix);
-      g.frustumCulled = false; g.castShadow = true; g.name = n;
-      body[0].parent.add(g);
-    }
-  }
   const holder = new THREE.Group(); holder.scale.set(MODEL.s * look[1], MODEL.s, MODEL.s * look[1]); holder.position.copy(MODEL.off); holder.add(inst);
   const body = new THREE.Group(); body.add(holder);
   const root = new THREE.Group(); root.add(body);
@@ -1523,10 +1505,38 @@ function makeModelZombie(type) {
   const hasWalk = !!(clips.walk || clips.run);
   const proc = !!(pb.thighL && pb.thighR) && (!hasWalk || !clips.attack);
   const rest = proc ? Object.values(pb).filter(Boolean).map(b => [b, b.quaternion.clone()]) : [];
-  return { root, body, spine: g(), head: g(), jaw: g(), legs: [g(), g()], knees: [g(), g()], arms: [g(), g()], elbows: [g(), g()],
-           hitboxes, mats, tilt: 0, cloth,
+  const zm = { root, body, spine: g(), head: g(), jaw: g(), legs: [g(), g()], knees: [g(), g()], arms: [g(), g()], elbows: [g(), g()],
+           hitboxes, mats, tilt: 0, cloth: null, outfit, skinWear: MODEL.name === 'zombie' ? skinWear : null,
            model: { inst, mixer: new THREE.AnimationMixer(inst), clips, cur: null, kind: '', headless: false, pb, proc, rest, hasWalk,
                     headBone: bone('head'), chestBone: bone('chest') } };
+  if (CLOTHES && zm.skinWear) dressModel(zm);
+  return zm;
+}
+
+// Put the Blender-modelled shirt and trousers on a zombie, bound to its own bones (also used on zombies already
+// walking about when the clothes file finishes loading). Painted-on clothes are switched off for it.
+function dressModel(m) {
+  const inst = m.model.inst, outfit = m.outfit;
+  const body = []; inst.traverse(o => { if (o.isSkinnedMesh) body.push(o); });
+  if (!body.length) return;
+  const cloth = { flap: new THREE.Vector4(), off: new THREE.Vector3(), v: new THREE.Vector3(), prev: new THREE.Vector3(), init: false,
+                  bone: inst.getObjectByName(MODEL.bones.waist || MODEL.bones.chest || '') };
+  const wear = (outfit.o.x > 0.5 ? [outfit.o.y > 50 ? 'Shirt_Long' : 'Shirt_Short'] : []).concat('Trousers');
+  for (const n of wear) {
+    const src = CLOTHES[n]; if (!src) continue;
+    // the garments were cut from the body surface, so they share its space: bind with the body's own bone inverses
+    const sk = body[0].skeleton, bones = src.skeleton.bones.map(b => sk.bones.find(x => x.name === b.name));
+    if (bones.some(b => !b)) continue;
+    const inv = bones.map(b => sk.boneInverses[sk.bones.indexOf(b)]);
+    const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9, side: THREE.DoubleSide });
+    infectSkin(mat, outfit, new THREE.Vector2(0, n === 'Trousers' ? 2 : 1), cloth.flap); m.mats.push(mat);
+    const g = new THREE.SkinnedMesh(src.geometry, mat);
+    g.bind(new THREE.Skeleton(bones, inv), body[0].bindMatrix);
+    g.frustumCulled = false; g.castShadow = true; g.name = n;
+    body[0].parent.add(g);
+  }
+  m.skinWear.forEach(w => w.x = 0);
+  m.cloth = cloth;
 }
 
 // Procedural limb motion layered on the model's own animation, for models that only come with an idle.
