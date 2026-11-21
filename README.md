@@ -14,7 +14,7 @@ A browser zombie shooter built with [three.js](https://threejs.org). 28 Days Lat
 
 ## Controls
 
-- **Mouse:** aim · **Click:** shoot · **Right-click / Space / R:** reload
+- **Mouse:** look and aim, Call of Duty style (click captures the mouse, **Esc** frees it and pauses) · **Click:** shoot · **Right-click / Space / R:** reload
 - Headshots kill instantly; chain hits for combos
 - Shoot pickups: first-aid box = life, ammo box = machine gun, crate = shotgun, grenade = bomb
 - Don't shoot the survivors

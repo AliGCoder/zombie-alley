@@ -30,7 +30,7 @@
 <div id="title">
   <h1>ZOMBIE ALLEY</h1>
   <h2>ARCADE</h2>
-  <p>AIM WITH THE MOUSE · CLICK TO SHOOT</p>
+  <p>MOUSE TO LOOK AND AIM (ESC FREES IT) · CLICK TO SHOOT</p>
   <p>RIGHT-CLICK, SPACE OR R TO RELOAD</p>
   <p>HEADSHOTS KILL INSTANTLY · CHAIN HITS FOR COMBOS</p>
   <p>SHOOT ♥ FOR LIFE · MG MACHINE GUN · SG SHOTGUN · BOMB CLEARS THE STREET</p>
@@ -627,9 +627,19 @@ new GLTFLoader().register(p => new SpecGlossPlugin(p)).load('assets/fps_arms/fps
   const mixer = new THREE.AnimationMixer(g.scene), clip = re => g.animations.find(a => re.test(a.name));
   const act = { idle: clip(/Idle/), walk: clip(/Walk/), fire: clip(/Fire/), reload: clip(/Reload_easy/) || clip(/Reload/) };
   for (const k in act) act[k] = act[k] && mixer.clipAction(act[k]);
-  VM = { holder, mixer, act, cur: null, busy: false, base: new THREE.Vector3(0.05, -0.13, 0.02), yaw: -0.069, pitch: -0.01 };   // yaw/pitch: the barrel sits ~4deg off the arm rig axis
+  VM = { holder, mixer, act, cur: null, busy: false, base: new THREE.Vector3(0.05, -0.13, 0.02), yaw: -0.069, pitch: -0.01, reach: 0.5, drop: 0.075, side: 0.085, follow: 0.62 };   // side/drop: gun sits bottom-right, like a shooter   // reach: muzzle depth in front of the eye; drop: how far under the crosshair   // yaw/pitch: the barrel sits ~4deg off the arm rig axis
   mixer.addEventListener('finished', () => { VM.busy = false; vmPlay(state === 'moving' ? 'walk' : 'idle'); });
   holder.add(muzzleLight); muzzleLight.position.copy(VM_MUZZLE);
+  // Keep only the gloves, wrists and forearms: drop triangles skinned to the upper arm and elbow bones.
+  // In a wide street view those swung into the edges of the screen as big grey sleeves and shoulders.
+  g.scene.traverse(o => { if (!o.isSkinnedMesh || o.material.name !== 'arms' || !o.geometry.index) return;
+    const gm = o.geometry, si = gm.attributes.skinIndex, sw = gm.attributes.skinWeight, idx = gm.index.array;
+    const cut = o.skeleton.bones.map(b => /UpArm|Twist_0[23]|Forearm|Arm_[LR]|Shoulder|Clav/i.test(b.name));
+    const gone = i => { let b = 0, w = -1; for (let k = 0; k < 4; k++) { const ww = sw.getComponent(i, k); if (ww > w) { w = ww; b = si.getComponent(i, k); } } return cut[b]; };
+    const keep = [];
+    for (let t = 0; t < idx.length; t += 3) if (!gone(idx[t]) && !gone(idx[t + 1]) && !gone(idx[t + 2])) keep.push(idx[t], idx[t + 1], idx[t + 2]);
+    gm.setIndex(keep);
+  });
   gunFill.intensity = 0.7;
   vmPlay('idle');
   modelInfo.innerHTML += '<br><span style="color:#888">ARMS &amp; PISTOL "FPS PISTOL ANIMATIONS" BY CRANSH (ARMS BY BUMSTRUM, PISTOL BY RAIMEIYONKE) · CC BY 4.0</span>';
@@ -1328,6 +1338,52 @@ function setModel(char, clips, name) {
   setInfo(`MODEL: ${name.toUpperCase().slice(0, 28)} · ${kinds.length ? kinds.join(' ').toUpperCase() : 'NO ANIMATIONS'}`);
 }
 
+// Infected skin (28 Days Later): grey-green pallor, bruising, dark veins, blood from the mouth down the chin and chest,
+// bloody hands, grime. Painted in the shader from the model's rest pose, so it sticks to the body while it moves.
+// The patromes model is in centimetres, z up, facing -y (mouth at z~166).
+const INFECT_GLSL = `
+varying vec3 vBind;
+float zh(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
+float zn(vec3 p) { vec3 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(zh(i), zh(i + vec3(1,0,0)), f.x), mix(zh(i + vec3(0,1,0)), zh(i + vec3(1,1,0)), f.x), f.y),
+             mix(mix(zh(i + vec3(0,0,1)), zh(i + vec3(1,0,1)), f.x), mix(zh(i + vec3(0,1,1)), zh(i + vec3(1,1,1)), f.x), f.y), f.z); }
+float zf(vec3 p) { return zn(p) * 0.55 + zn(p * 2.1) * 0.3 + zn(p * 4.3) * 0.15; }
+`;
+const INFECT_PAINT = `#include <map_fragment>
+  vec3 P = vBind; float front = smoothstep(2.0, -6.0, P.y);
+  // blood: a dark wet smear from the mouth down chin, neck and chest, running in drips
+  float drip = zn(vec3(P.x * 0.22, P.z * 0.012, 3.0)), mouthD = length((P - vec3(0.0, -7.0, 165.5)) * vec3(1.0, 1.0, 1.4));
+  float run = front * smoothstep(168.0, 160.0, P.z) * smoothstep(105.0 + drip * 30.0, 150.0, P.z) * smoothstep(22.0, 6.0, abs(P.x) + (1.0 - drip) * 14.0);
+  float blood = max(smoothstep(13.0, 4.0, mouthD + zn(P * 0.6) * 4.0), run * smoothstep(0.25, 0.45, drip + zf(P * 0.15) * 0.4));
+  blood = max(blood, smoothstep(55.0, 80.0, abs(P.x)) * smoothstep(0.45, 0.65, zf(P * 0.12)));   // hands and forearms
+  blood = max(blood, smoothstep(0.72, 0.8, zf(P * 0.09 + 7.0)) * 0.9);                          // spatters all over
+  float grime = zf(P * 0.05);
+#ifdef INFECT_CLOTH
+  diffuseColor.rgb = mix(diffuseColor.rgb * vec3(0.55, 0.5, 0.45), vec3(0.08, 0.07, 0.06), grime * 0.6);
+#else
+  float l = dot(diffuseColor.rgb, vec3(0.3, 0.59, 0.11));
+  vec3 c = mix(diffuseColor.rgb, l * vec3(0.84, 0.9, 0.8), 0.88) * 0.9;                    // sickly grey-green pallor
+  c = mix(c, c * vec3(0.62, 0.48, 0.55), smoothstep(0.45, 0.75, zf(P * 0.07)));                // purple-brown bruising
+  float vein = smoothstep(0.06, 0.0, abs(zf(P * 0.32) - 0.5)) * smoothstep(0.3, 0.6, zn(P * 0.05));
+  c = mix(c, vec3(0.16, 0.12, 0.2), vein * 0.8);                                              // dark veins
+  float sock = front * smoothstep(9.0, 3.0, length((vec3(abs(P.x), P.y, P.z) - vec3(3.3, -6.0, 172.5)) * vec3(0.8, 1.0, 1.3)));
+  c = mix(c, vec3(0.22, 0.03, 0.03), sock * 0.85);                                             // raw red eye sockets
+  c *= 1.0 - smoothstep(110.0, 0.0, P.z) * grime * 0.45;                                       // filth on the legs
+  diffuseColor.rgb = c;
+#endif
+  diffuseColor.rgb = mix(diffuseColor.rgb, mix(vec3(0.3, 0.015, 0.01), vec3(0.12, 0.01, 0.01), zn(P * 0.4)), blood);
+  float zBlood = blood;`;
+function infectSkin(m, cloth) {
+  m.onBeforeCompile = sh => {
+    sh.vertexShader = 'varying vec3 vBind;\n' + sh.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\n  vBind = position;');
+    sh.fragmentShader = (cloth ? '#define INFECT_CLOTH\n' : '') + INFECT_GLSL + sh.fragmentShader
+      .replace('#include <map_fragment>', INFECT_PAINT)
+      .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n  roughnessFactor = mix(roughnessFactor, 0.22, zBlood);');
+  };
+  m.customProgramCacheKey = () => cloth ? 'infect-cloth' : 'infect-skin';
+  m.needsUpdate = true;
+}
+
 const _hv = new THREE.Vector3();
 function makeModelZombie(type) {
   const inst = SkeletonUtils.clone(MODEL.tpl), mats = [];
@@ -1343,6 +1399,8 @@ function makeModelZombie(type) {
   mats.forEach(m => {
     if (/eye_[lr]|cornea/i.test(m.name) && !/occlusion/i.test(m.name)) { m.color.multiply(new THREE.Color(0xff5050)); m.userData.em = 0x9a0000; m.emissive.setHex(0x9a0000); }
     else if (/mouth|teeth|tongue/i.test(m.name)) m.color.multiply(new THREE.Color(0x9a2a2a));
+    if (MODEL.name === 'zombie' && /skin|nails/i.test(m.name)) infectSkin(m, false);
+    else if (MODEL.name === 'zombie' && /boxers|cloth|shirt|pants/i.test(m.name)) infectSkin(m, true);
   });
   const holder = new THREE.Group(); holder.scale.set(MODEL.s * look[1], MODEL.s, MODEL.s * look[1]); holder.position.copy(MODEL.off); holder.add(inst);
   const body = new THREE.Group(); body.add(holder);
@@ -1944,20 +2002,34 @@ function showMsg(big, small, time, color = '#ffd400') { msg = { big, small, t: t
 
 // ======================= Input =======================
 let mouseHeld = false, gunKick = 0;
-addEventListener('mousemove', e => { cursor.x = e.clientX; cursor.y = e.clientY; });
+// Mouse look (like Call of Duty): the mouse is captured, the crosshair stays in the middle and the camera turns.
+// Without pointer lock (or before the first click) it falls back to a free cursor.
+const look = { yaw: 0, pitch: 0, sens: 0.0022 };
+const locked = () => document.pointerLockElement === renderer.domElement;
+function lockMouse() { try { const r = renderer.domElement.requestPointerLock(); if (r && r.catch) r.catch(() => {}); } catch (er) {} }
+addEventListener('mousemove', e => {
+  if (locked()) {
+    look.yaw = THREE.MathUtils.clamp(look.yaw - e.movementX * look.sens, -1.3, 1.3);         // up to ~75 deg either side
+    look.pitch = THREE.MathUtils.clamp(look.pitch - e.movementY * look.sens, -0.55, 0.5);
+  } else { cursor.x = e.clientX; cursor.y = e.clientY; }
+});
+document.addEventListener('pointerlockchange', () => {
+  if (!locked() && ['moving', 'fight', 'clear'].includes(state)) togglePause();   // Esc frees the mouse: pause
+});
 addEventListener('contextmenu', e => e.preventDefault());
 addEventListener('mousedown', e => {
   ac(); if (actx.state === 'suspended') actx.resume();
   if (e.button === 2) { reload(); return; }
   if (e.button !== 0) return;
   mouseHeld = true;
-  if (state === 'title') return newGame();
+  if (state !== 'over' && state !== 'initials') lockMouse();
+  if (state === 'title') { look.yaw = look.pitch = 0; return newGame(); }
   if (state === 'initials') return;
   if (state === 'continue') {
     lives = MAX_LIVES; continues++; invuln = 2; state = 'fight';
     globs.forEach(b => scene.remove(b.mesh)); globs = []; zombies.forEach(z => { if (z.alive) z.m.root.position.z -= 4; }); return; }
   if (state === 'over') { state = 'title'; clearEntities(); document.getElementById('title').style.display = 'flex'; return; }
-  if (state === 'paused') return;
+  if (state === 'paused') { togglePause(); return; }   // click to carry on (and recapture the mouse)
   shoot();
 });
 addEventListener('mouseup', e => { if (e.button === 0) mouseHeld = false; });
@@ -2199,9 +2271,11 @@ function saveInitials() {
 // ======================= Camera + gun pose =======================
 const aimPoint = new THREE.Vector3();
 let time = 0, camPan = 0, camTilt = 0;
-const _vmT = new THREE.Vector3();
+const _vmT = new THREE.Vector3(), _vmD = new THREE.Vector3(), _vmO = new THREE.Vector3(), _vmO2 = new THREE.Vector3(), _vmM = new THREE.Matrix4();
 function updateCamera(dt) {
   time += dt;
+  const fps = locked();
+  if (fps) { cursor.x = W / 2; cursor.y = H / 2; }   // mouse look: the crosshair lives in the middle of the screen
   const n = ndc();
   const moving = state === 'moving';
   const sx = (Math.random() - .5) * shake, sy = (Math.random() - .5) * shake;
@@ -2209,12 +2283,14 @@ function updateCamera(dt) {
   // Edge panning: push the cursor toward the left/right edge and the camera swings to look that way
   let panTarget, tiltTarget = n.y * 0.05;
   if (state === 'title') panTarget = Math.sin(time * 0.3) * 0.15;
+  else if (fps) { panTarget = look.yaw; tiltTarget = look.pitch; }
   else {
     const e = Math.max(0, (Math.abs(n.x) - 0.45) / 0.55);
     panTarget = -Math.sign(n.x) * e * e * 0.75 - n.x * 0.06;
   }
-  camPan += (panTarget - camPan) * Math.min(1, dt * 5);
-  camTilt += (tiltTarget - camTilt) * Math.min(1, dt * 5);
+  const k = Math.min(1, dt * (fps ? 30 : 5));   // mouse look follows the mouse almost instantly
+  camPan += (panTarget - camPan) * k;
+  camTilt += (tiltTarget - camTilt) * k;
   camera.rotation.set(camTilt, camPan, 0, 'YXZ');
   camera.updateMatrixWorld(true);
 
@@ -2232,12 +2308,16 @@ function updateCamera(dt) {
   if (VM) {   // real arms: sway toward the cursor, bob while walking, animations from the model
     const h = VM.holder;
     h.visible = state !== 'title';
-    h.position.set(VM.base.x + n.x * 0.06, VM.base.y + n.y * 0.04 - gunKick * 0.012, VM.base.z + gunKick * 0.03);
-    // point the barrel exactly through the crosshair: aim the muzzle (not the arm's pivot) at the cursor's world point
-    h.rotation.set(0, Math.PI, 0); h.updateMatrixWorld(true);   // fresh start each frame (a bad frame can't stick)
-    const mz = h.localToWorld(VM_MUZZLE.clone()), pv = h.getWorldPosition(new THREE.Vector3());
-    h.lookAt(_vmT.copy(aimPoint).add(pv).sub(mz));
-    h.rotateY(VM.yaw); h.rotateX(VM.pitch - gunKick * 0.12);
+    // the barrel runs parallel to your line of fire, just under it, so it always points straight at the crosshair.
+    // The arms are placed from the muzzle backwards (not swung round the shoulder, which put the shoulder in your view).
+    const ty = Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2), tx = ty * camera.aspect;
+    // the gun slides most of the way toward the cursor (not into the corners) and angles the rest to meet it
+    const bob = state === 'moving' ? Math.sin(time * 7) * 0.006 : Math.sin(time * 1.3) * 0.002;
+    _vmT.set(n.x * tx * VM.follow * VM.reach + VM.side, n.y * ty * VM.follow * VM.reach - VM.drop + bob, -VM.reach + gunKick * 0.03);   // muzzle spot
+    const dir = _vmD.set(n.x * tx * 20, n.y * ty * 20, -20).sub(_vmT).normalize();   // muzzle -> the point under the cursor
+    _vmM.lookAt(dir, _vmO, camera.up); h.quaternion.setFromRotationMatrix(_vmM);
+    h.rotateY(VM.yaw); h.rotateX(VM.pitch - gunKick * 0.12);              // rig's barrel offset + recoil flip
+    h.position.copy(_vmT).sub(_vmO2.copy(VM_MUZZLE).applyQuaternion(h.quaternion));
     if (!VM.busy) vmPlay(state === 'moving' ? 'walk' : 'idle');
     VM.mixer.update(dt);
   }
@@ -2385,7 +2465,7 @@ function drawHUD() {
   if (state === 'paused') {
     g.fillStyle = '#000a'; g.fillRect(0, 0, W, H);
     text('PAUSED', W / 2, H / 2, 36 * s, '#ffd400', 'center');
-    text('PRESS P TO RESUME', W / 2, H / 2 + 50, 12 * s, '#fff', 'center');
+    text('CLICK TO RESUME', W / 2, H / 2 + 50, 12 * s, '#fff', 'center');
   }
 
   // Off-screen warnings: arrows at the screen edge point to zombies you can't see
