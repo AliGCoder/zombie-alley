@@ -10,7 +10,9 @@ http.createServer((req, res) => {
   if (!file.startsWith(root)) { res.writeHead(403); return res.end(); }
   fs.stat(file, (err, st) => {
     if (err || !st.isFile()) { res.writeHead(404); return res.end('not found'); }
-    res.writeHead(200, { 'Content-Type': types[path.extname(file).toLowerCase()] || 'application/octet-stream', 'Content-Length': st.size });
+    // no-cache: the browser must check for a newer version every time (so you never play an old copy of the game)
+    res.writeHead(200, { 'Content-Type': types[path.extname(file).toLowerCase()] || 'application/octet-stream', 'Content-Length': st.size,
+                         'Cache-Control': 'no-cache', 'Last-Modified': st.mtime.toUTCString() });
     fs.createReadStream(file).pipe(res);
   });
 }).listen(port, '127.0.0.1', () => console.log(`Zombie Alley running at http://localhost:${port}/zombie-arcade.html`));

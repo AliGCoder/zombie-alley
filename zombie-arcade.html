@@ -187,6 +187,7 @@ const hud = document.getElementById('hud');
 const g = hud.getContext('2d');
 let W = innerWidth, H = innerHeight, DPR = 1;
 function resize() {
+  if (!innerWidth || !innerHeight) return;   // minimised/hidden window: keep the last size (0/0 would break the camera)
   W = innerWidth; H = innerHeight; DPR = Math.min(devicePixelRatio, 2);
   renderer.setSize(W, H);
   camera.aspect = W / H;
@@ -616,7 +617,7 @@ const nodesOf = (sc, keep) => { const g = new THREE.Group(); sc.children.filter(
 })();
 // First-person arms + pistol: "FPS pistol animations" by Cransh (arms by bumstrum, pistol by raimeiyonke), CC BY 4.0
 let VM = null;
-const VM_MUZZLE = new THREE.Vector3(-0.055, 0.11, 0.53), VM_PORT = new THREE.Vector3(-0.06, 0.135, 0.42);
+const VM_MUZZLE = new THREE.Vector3(-0.022, 0.117, 0.53), VM_PORT = new THREE.Vector3(-0.06, 0.135, 0.42);
 new GLTFLoader().register(p => new SpecGlossPlugin(p)).load('assets/fps_arms/fps_pistol_arms.glb', g => {
   const holder = new THREE.Group(); holder.add(g.scene); camera.add(holder);
   g.scene.traverse(o => { if (o.isMesh) { o.frustumCulled = false; const m = o.material; if (!m) return;
@@ -626,7 +627,7 @@ new GLTFLoader().register(p => new SpecGlossPlugin(p)).load('assets/fps_arms/fps
   const mixer = new THREE.AnimationMixer(g.scene), clip = re => g.animations.find(a => re.test(a.name));
   const act = { idle: clip(/Idle/), walk: clip(/Walk/), fire: clip(/Fire/), reload: clip(/Reload_easy/) || clip(/Reload/) };
   for (const k in act) act[k] = act[k] && mixer.clipAction(act[k]);
-  VM = { holder, mixer, act, cur: null, busy: false, base: new THREE.Vector3(0.05, -0.13, 0.02) };
+  VM = { holder, mixer, act, cur: null, busy: false, base: new THREE.Vector3(0.05, -0.13, 0.02), yaw: -0.069, pitch: -0.01 };   // yaw/pitch: the barrel sits ~4deg off the arm rig axis
   mixer.addEventListener('finished', () => { VM.busy = false; vmPlay(state === 'moving' ? 'walk' : 'idle'); });
   holder.add(muzzleLight); muzzleLight.position.copy(VM_MUZZLE);
   gunFill.intensity = 0.7;
@@ -1464,15 +1465,19 @@ addEventListener('drop', async e => { e.preventDefault(); if (e.dataTransfer.fil
 const modelFile = document.getElementById('modelFile');
 modelFile.addEventListener('change', async () => { if (modelFile.files.length) loadModelFiles(await readFiles(modelFile.files)); modelFile.value = ''; });
 function removeModel() { MODEL.tpl = null; MODEL.clips = {}; setInfo('USING BUILT-IN ZOMBIES', '#aaa'); idb('readwrite', st => st.delete('files')).catch(() => {}); }
-// Bring back a saved model, else try models/zombie.glb next to the game (works when served over http)
-idb('readonly', st => st.get('files')).then(f => f ? loadModelFiles(f, false) : Promise.reject()).catch(() =>
-  fetch('models/zombie.glb').then(r => r.ok ? r.arrayBuffer() : Promise.reject())
-    // on GitHub Pages the 113MB model lives in Git LFS: Pages only has a tiny pointer file, so fetch the real one
-    .then(buf => buf.byteLength < 2000 && location.hostname.endsWith('github.io')
-      ? fetch('https://media.githubusercontent.com/media/AliGCoder/zombie-alley/main/models/zombie.glb').then(r => r.ok ? r.arrayBuffer() : Promise.reject())
-      : buf)
-    .then(buf => loadModelFiles([{ name: 'zombie.glb', buf }], false))
-    .then(ok => { if (ok) modelInfo.innerHTML += '<br><span style="color:#888">ZOMBIE MODEL "ZOMBIE" BY PATROMES (SKETCHFAB) · CC BY 4.0</span>'; })
+// Always load the real zombie (models/zombie.glb) first; a model saved from an old drag-and-drop is only a fallback
+fetch('models/zombie.glb', { cache: 'no-cache' }).then(r => r.ok ? r.arrayBuffer() : Promise.reject())
+  // on GitHub Pages the 113MB model lives in Git LFS: Pages only has a tiny pointer file, so fetch the real one
+  .then(buf => buf.byteLength < 2000
+    ? fetch('https://media.githubusercontent.com/media/AliGCoder/zombie-alley/main/models/zombie.glb').then(r => r.ok ? r.arrayBuffer() : Promise.reject())
+    : buf)
+  .then(buf => loadModelFiles([{ name: 'zombie.glb', buf }], false))
+  .then(ok => {
+    if (!ok) return Promise.reject();
+    modelInfo.innerHTML += '<br><span style="color:#888">ZOMBIE MODEL "ZOMBIE" BY PATROMES (SKETCHFAB) · CC BY 4.0</span>';
+    idb('readwrite', st => st.delete('files')).catch(() => {});   // forget any stale test model
+  })
+  .catch(() => idb('readonly', st => st.get('files')).then(f => f ? loadModelFiles(f, false) : Promise.reject())
     .catch(() => setInfo('USING BUILT-IN ZOMBIES', '#aaa')));
 
 // ======================= Game state =======================
@@ -2194,6 +2199,7 @@ function saveInitials() {
 // ======================= Camera + gun pose =======================
 const aimPoint = new THREE.Vector3();
 let time = 0, camPan = 0, camTilt = 0;
+const _vmT = new THREE.Vector3();
 function updateCamera(dt) {
   time += dt;
   const n = ndc();
@@ -2226,8 +2232,12 @@ function updateCamera(dt) {
   if (VM) {   // real arms: sway toward the cursor, bob while walking, animations from the model
     const h = VM.holder;
     h.visible = state !== 'title';
-    h.rotation.set(n.y * 0.22 + camTilt * 0.5, Math.PI - n.x * 0.32, 0);
-    h.position.set(VM.base.x + n.x * 0.02, VM.base.y + n.y * 0.015 - gunKick * 0.012, VM.base.z + gunKick * 0.03);
+    h.position.set(VM.base.x + n.x * 0.06, VM.base.y + n.y * 0.04 - gunKick * 0.012, VM.base.z + gunKick * 0.03);
+    // point the barrel exactly through the crosshair: aim the muzzle (not the arm's pivot) at the cursor's world point
+    h.rotation.set(0, Math.PI, 0); h.updateMatrixWorld(true);   // fresh start each frame (a bad frame can't stick)
+    const mz = h.localToWorld(VM_MUZZLE.clone()), pv = h.getWorldPosition(new THREE.Vector3());
+    h.lookAt(_vmT.copy(aimPoint).add(pv).sub(mz));
+    h.rotateY(VM.yaw); h.rotateX(VM.pitch - gunKick * 0.12);
     if (!VM.busy) vmPlay(state === 'moving' ? 'walk' : 'idle');
     VM.mixer.update(dt);
   }
